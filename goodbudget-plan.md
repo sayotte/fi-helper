@@ -582,7 +582,73 @@ Manually verify in Goodbudget UI: those 5 Amazon transactions now have correct s
 
 ---
 
-### Step 11 — Full run
+### Step 11 — Refactor sync_goodbudget.py
+
+Timeout failures on the full run exposed duplicated code that makes adding retry/backoff
+messy. Clean up first, then add resilience.
+
+#### Step 11.1 — Consolidate CSV loaders
+
+Replace `load_classified()`, `load_split_rows()`, `load_historical_split_rows()`,
+`load_historical_clr_rows()` with a single function:
+
+```python
+def load_classified_rows(source=None, sources=None, status=None, exclude_envelopes=None):
+```
+
+Read `classified.csv` once, filter by keyword args. Each call site becomes a one-liner.
+
+#### Step 11.2 — Extract shared update loop
+
+Extract the try/except + enumerate + updated/skipped pattern from `cmd_sync`,
+`cmd_sync_splits`, and `cmd_historical_single` into:
+
+```python
+def run_updates(opener, items, update_fn, label=""):
+    """Returns (updated, skipped). Catches RuntimeError and aborts."""
+```
+
+Each `update_fn` is a closure capturing `env_map`, `household_id`, etc.
+
+#### Step 11.3 — Unify dry-run into command paths
+
+Push `dry_run` as a parameter into `cmd_sync`, `cmd_sync_splits`, `cmd_historical_single`.
+Delete `cmd_dry_run()`. Extend `update_envelope()` to accept `dry_run=True`.
+
+#### Step 11.4 — Fix `--limit` not applying to splits in default mode
+
+Line 884: `cmd_sync_splits(opener, historical=args.historical)` doesn't pass `limit`.
+Pass it through so `--limit N` applies to all phases.
+
+#### Step 11.5 — Add mutual exclusivity for `--splits-only` / `--historical-single`
+
+Use `argparse` mutually exclusive group.
+
+#### Step 11.6 — Remove session requirement from offline steps
+
+`cmd_match` and `cmd_show_splits` don't need a live session unless `--historical-single`
+is passed. Make `session()` optional for offline-only steps.
+
+---
+
+### Step 12 — Retry with exponential backoff
+
+Add `api_request()` wrapper to replace all 11 `opener.open()` calls:
+
+```python
+def api_request(opener, url_or_req, timeout=30, max_retries=3, label=""):
+```
+
+- Sets `timeout` on each request (default 30s)
+- On `URLError` / `socket.timeout` / `RemoteDisconnected`: retry up to `max_retries`
+  with exponential backoff (2s, 4s, 8s)
+- Print `Retry {n}/{max}: {label} after {wait}s...`
+- On HTTP 4xx: raise immediately (non-retryable)
+- Increase inter-update sleep from 0.2s → 0.5s
+
+---
+
+### Step 13 — Full run (was Step 11)
 
 ```bash
 python3 sync_goodbudget.py

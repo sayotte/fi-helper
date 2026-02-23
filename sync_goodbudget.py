@@ -6,12 +6,15 @@ import base64
 import csv
 import datetime
 import getpass
+import http.client
 import http.cookiejar
 import json
 import math
 import os
 import re
+import socket
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -41,6 +44,43 @@ def make_opener():
         ("Referer", f"{BASE_URL}/home"),
     ]
     return opener
+
+
+RETRYABLE_ERRORS = (
+    socket.timeout,
+    urllib.error.URLError,
+    http.client.RemoteDisconnected,
+    ConnectionResetError,
+    ConnectionAbortedError,
+)
+
+
+def api_request(opener, url_or_req, timeout=30, max_retries=3, label=""):
+    """Make an HTTP request with timeout and exponential backoff retry.
+
+    Returns the decoded response body as bytes.
+    Retries on timeout, connection reset, and server errors (5xx).
+    Raises immediately on client errors (4xx).
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            with opener.open(url_or_req, timeout=timeout) as resp:
+                return resp.read()
+        except RETRYABLE_ERRORS as e:
+            if attempt == max_retries:
+                raise
+            wait = 2 * (2 ** attempt)  # 2s, 4s, 8s
+            desc = label or str(url_or_req)[:60]
+            print(f"  Retry {attempt + 1}/{max_retries}: {desc} after {wait}s ({e})")
+            time.sleep(wait)
+        except urllib.error.HTTPError as e:
+            if e.code >= 500 and attempt < max_retries:
+                wait = 2 * (2 ** attempt)
+                desc = label or str(url_or_req)[:60]
+                print(f"  Retry {attempt + 1}/{max_retries}: {desc} after {wait}s (HTTP {e.code})")
+                time.sleep(wait)
+            else:
+                raise
 
 
 SECRETS_FILE = os.path.join(os.path.dirname(__file__), "secrets.sh")
@@ -95,14 +135,12 @@ def login(opener, user, passwd):
     }
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     # urllib follows the 302 redirect automatically; GBSESS cookie lands in the jar
-    with opener.open(req) as resp:
-        resp.read()
+    api_request(opener, req, label="login")
 
 
 def get_household_id(opener):
     url = f"{BASE_URL}/home"
-    with opener.open(url) as resp:
-        html = resp.read().decode("utf-8", errors="replace")
+    html = api_request(opener, url, label="get household_id").decode("utf-8", errors="replace")
     # Find "householdData" then grab the first Uuid after it
     idx = html.find("householdData")
     if idx == -1:
@@ -133,8 +171,7 @@ def _walk_nodes(nodes, result, name_field, filter_fn=None, prune_fn=None):
 
 def get_envelope_map(opener):
     url = f"{BASE_URL}/api/envelopes"
-    with opener.open(url) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    data = json.loads(api_request(opener, url, label="get envelopes"))
     result = {}
     _walk_nodes(data[0]["nodes"], result, "FullName")
     return result
@@ -142,8 +179,7 @@ def get_envelope_map(opener):
 
 def get_account_map(opener):
     url = f"{BASE_URL}/api/accounts"
-    with opener.open(url) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    data = json.loads(api_request(opener, url, label="get accounts"))
     result = {}
     _walk_nodes(data[0]["nodes"], result, "Name",
                 filter_fn=lambda n: n.get("AccountType") != "DEBT",
@@ -153,8 +189,7 @@ def get_account_map(opener):
 
 def logout(opener):
     url = f"{BASE_URL}/logout"
-    with opener.open(url) as resp:
-        resp.read()
+    api_request(opener, url, label="logout")
 
 
 def cmd_auth(opener):
@@ -183,8 +218,7 @@ def get_ntc_transactions(opener):
     while True:
         ts = int(time.time() * 1000)
         url = f"{BASE_URL}/api/ntc_transactions?page={page}&_={ts}"
-        with opener.open(url) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        data = json.loads(api_request(opener, url, label=f"ntc page {page}"))
         if total is None:
             total = data["count"]
             num_pages = math.ceil(total / 120)
@@ -215,8 +249,7 @@ def get_all_transactions(opener):
     while True:
         ts = int(time.time() * 1000)
         url = f"{BASE_URL}/api/transactions?page={page}&_={ts}"
-        with opener.open(url) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        data = json.loads(api_request(opener, url, label=f"all txn page {page}"))
         page_items = data["items"]
         all_items.extend(page_items)
         if len(page_items) < 120:
@@ -239,41 +272,25 @@ def cmd_fetch_all(opener):
     print(f"{ALL_TXN_CACHE} written.")
 
 
-def load_classified():
+def load_classified_rows(source=None, sources=None, status=None, exclude_envelopes=None):
+    """Load rows from classified.csv with optional filters.
+
+    source: single source string to match
+    sources: set/list of source strings to match (alternative to source)
+    status: status string to match (e.g. "NTC", "CLR")
+    exclude_envelopes: set of envelope names to exclude
+    """
     rows = []
+    match_sources = {source} if source else (set(sources) if sources else None)
     with open(CLASSIFIED_CSV, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            if row["source"] == "goodbudget" and row["envelope"] not in SKIP_ENVELOPES:
-                rows.append(row)
-    return rows
-
-
-def load_split_rows():
-    rows = []
-    with open(CLASSIFIED_CSV, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            if row["source"] in ("amazon_order", "costco_receipt") and row["status"] == "NTC":
-                rows.append(row)
-    return rows
-
-
-def load_historical_split_rows():
-    rows = []
-    with open(CLASSIFIED_CSV, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            if row["source"] in ("amazon_order", "costco_receipt") and row["status"] == "CLR":
-                rows.append(row)
-    return rows
-
-
-def load_historical_clr_rows():
-    rows = []
-    with open(CLASSIFIED_CSV, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            if (row["source"] == "goodbudget"
-                    and row["status"] == "CLR"
-                    and row["envelope"] not in SKIP_ENVELOPES):
-                rows.append(row)
+            if match_sources and row["source"] not in match_sources:
+                continue
+            if status and row["status"] != status:
+                continue
+            if exclude_envelopes and row["envelope"] in exclude_envelopes:
+                continue
+            rows.append(row)
     return rows
 
 
@@ -377,8 +394,7 @@ def update_split_envelope(opener, ntc_item, clf_rows, env_map, household_id,
 
     # Multi-envelope split: GET nonce, POST SPL payload with children
     url = f"{BASE_URL}/api/transactions/get/{ntc_item['uuid']}"
-    with opener.open(url) as resp:
-        txn_detail = json.loads(resp.read().decode("utf-8"))
+    txn_detail = json.loads(api_request(opener, url, label=f"get nonce (split) {ntc_item['receiver'][:30]}"))
     nonce = txn_detail["nonce"]
 
     children = [
@@ -412,19 +428,18 @@ def update_split_envelope(opener, ntc_item, clf_rows, env_map, household_id,
     req = urllib.request.Request(save_url, data=body, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
     req.add_header("Origin", BASE_URL)
-    with opener.open(req) as resp:
-        resp_data = json.loads(resp.read().decode("utf-8"))
+    resp_data = json.loads(api_request(opener, req, label=f"save split {txn_detail['receiver'][:30]}"))
     if resp_data.get("status") != 202:
         raise RuntimeError(
             f"Unexpected split response for {txn_detail['uuid']} "
             f"{txn_detail['receiver']!r}: {resp_data}"
         )
-    time.sleep(0.2)
+    time.sleep(0.5)
     return True
 
 
-def cmd_classified(opener):
-    rows = load_classified()
+def cmd_classified(opener=None):
+    rows = load_classified_rows(source="goodbudget", exclude_envelopes=SKIP_ENVELOPES)
     print(f"{len(rows)} goodbudget rows ready to sync.")
     if rows:
         r = rows[0]
@@ -465,12 +480,12 @@ def match_classified_to_ntc(classified_rows, ntc_index):
     return matched, no_match, []
 
 
-def cmd_match(opener, historical=False, historical_single=False):
+def cmd_match(opener=None, historical=False, historical_single=False):
     with open(NTC_CACHE) as f:
         ntc_items = json.load(f)
     ntc_index = build_ntc_index(ntc_items)
     total_needs = sum(len(v) for v in ntc_index.values())
-    classified_rows = load_classified()
+    classified_rows = load_classified_rows(source="goodbudget", exclude_envelopes=SKIP_ENVELOPES)
     matched, no_match, ambiguous = match_classified_to_ntc(classified_rows, ntc_index)
     print(f"Match results (against {total_needs} [Needs Envelope] NTC transactions):")
     print(f"  Unique match:  {len(matched)}")
@@ -481,7 +496,7 @@ def cmd_match(opener, historical=False, historical_single=False):
         for item in no_match:
             print(f"  {item['created'][:10]} | {item['receiver'][:50]} | ${item['amount']}")
 
-    split_rows = load_split_rows()
+    split_rows = load_classified_rows(sources=("amazon_order", "costco_receipt"), status="NTC")
     split_index = build_split_index(split_rows)
     split_matched, split_no_match = match_splits_to_ntc(split_index, ntc_index)
     print(f"\nSplit match results ({len(split_index)} Amazon/Costco groups):")
@@ -495,7 +510,7 @@ def cmd_match(opener, historical=False, historical_single=False):
         with open(ALL_TXN_CACHE) as f:
             all_items = json.load(f)
         hist_index = build_amazon_costco_index(all_items)
-        hist_rows = load_historical_split_rows()
+        hist_rows = load_classified_rows(sources=("amazon_order", "costco_receipt"), status="CLR")
         hist_split_index = build_split_index(hist_rows)
         hist_matched, hist_no_match = match_splits_to_ntc(hist_split_index, hist_index)
         print(f"\nHistorical CLR match results ({len(hist_split_index)} Amazon/Costco groups):")
@@ -509,7 +524,7 @@ def cmd_match(opener, historical=False, historical_single=False):
         with open(ALL_TXN_CACHE) as f:
             all_items = json.load(f)
         clr_index = build_clr_txn_index(all_items)
-        hist_rows = load_historical_clr_rows()
+        hist_rows = load_classified_rows(source="goodbudget", status="CLR", exclude_envelopes=SKIP_ENVELOPES)
         matched, no_match, _ = match_classified_to_ntc(hist_rows, clr_index)
         env_map = get_envelope_map(opener)
         already_correct = sum(
@@ -536,7 +551,8 @@ def resolve_envelope_uuid(env_name, env_map):
     return None
 
 
-def update_envelope(opener, ntc_item, clf_row, env_map, household_id):
+def update_envelope(opener, ntc_item, clf_row, env_map, household_id,
+                    dry_run=False, prefix=""):
     """GET nonce, then POST to assign a single envelope to an NTC transaction.
 
     Returns True on success, False if the envelope name cannot be resolved (skip).
@@ -547,10 +563,21 @@ def update_envelope(opener, ntc_item, clf_row, env_map, household_id):
         print(f"  SKIP (unknown envelope {clf_row['envelope']!r}): {ntc_item['receiver']}")
         return False
 
+    if dry_run:
+        env_name = clf_row["envelope"]
+        date = ntc_item["created"][:10]
+        tag = f"[DRY RUN {prefix}]" if prefix else "[DRY RUN]"
+        if env_name.startswith("Income:"):
+            print(f"{tag} {ntc_item['receiver'][:45]:<45}  {date}  "
+                  f"${ntc_item['amount']:>10}  →  [Available] ({env_name})")
+        else:
+            print(f"{tag} {ntc_item['receiver'][:45]:<45}  {date}  "
+                  f"${ntc_item['amount']:>10}  →  {env_name}")
+        return True
+
     # Fetch current transaction detail to get nonce and canonical field values
     url = f"{BASE_URL}/api/transactions/get/{ntc_item['uuid']}"
-    with opener.open(url) as resp:
-        txn_detail = json.loads(resp.read().decode("utf-8"))
+    txn_detail = json.loads(api_request(opener, url, label=f"get nonce {ntc_item['receiver'][:30]}"))
     nonce = txn_detail["nonce"]
 
     payload = {
@@ -579,96 +606,22 @@ def update_envelope(opener, ntc_item, clf_row, env_map, household_id):
     req = urllib.request.Request(save_url, data=body, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
     req.add_header("Origin", BASE_URL)
-    with opener.open(req) as resp:
-        resp_data = json.loads(resp.read().decode("utf-8"))
+    resp_data = json.loads(api_request(opener, req, label=f"save {txn_detail['receiver'][:30]}"))
 
     if resp_data.get("status") != 202:
         raise RuntimeError(
             f"Unexpected response for {txn_detail['uuid']} {txn_detail['receiver']!r}: {resp_data}"
         )
 
-    time.sleep(0.2)
+    time.sleep(0.5)
     return True
 
 
-def cmd_dry_run(opener, historical=False, historical_single=False):
-    env_map = get_envelope_map(opener)
+def cmd_show_splits(opener=None):
     with open(NTC_CACHE) as f:
         ntc_items = json.load(f)
     ntc_index = build_ntc_index(ntc_items)
-    classified_rows = load_classified()
-    matched, no_match, ambiguous = match_classified_to_ntc(classified_rows, ntc_index)
-    unknown_env = []
-    for clf_row, ntc_item in matched:
-        env_name = clf_row["envelope"]
-        env_uuid = resolve_envelope_uuid(env_name, env_map)
-        if not env_uuid:
-            unknown_env.append(env_name)
-            continue
-        date = ntc_item["created"][:10]
-        display_name = "[Available]" if env_name.startswith("Income:") else env_name
-        print(f"[DRY RUN] {ntc_item['receiver'][:45]:<45}  {date}  ${ntc_item['amount']:>10}  →  {display_name} ({env_name})" if env_name.startswith("Income:") else
-              f"[DRY RUN] {ntc_item['receiver'][:45]:<45}  {date}  ${ntc_item['amount']:>10}  →  {env_name}")
-    print(f"\nSummary: {len(matched)} to update, {len(no_match)} skipped (no match), "
-          f"{len(ambiguous)} ambiguous, {len(unknown_env)} unknown envelopes.")
-    if unknown_env:
-        for e in unknown_env:
-            print(f"  UNKNOWN ENVELOPE: {e!r}")
-
-    split_rows = load_split_rows()
-    split_index = build_split_index(split_rows)
-    split_matched, _ = match_splits_to_ntc(split_index, ntc_index)
-    split_unknown = 0
-    for ntc_item, clf_rows in split_matched:
-        bad = [r for r in clf_rows if not resolve_envelope_uuid(r["envelope"], env_map)]
-        if bad:
-            split_unknown += len(bad)
-            continue
-        update_split_envelope(None, ntc_item, clf_rows, env_map, None, dry_run=True)
-    print(f"Split summary: {len(split_matched)} groups to update, {split_unknown} unknown envelopes.")
-
-    if historical:
-        with open(ALL_TXN_CACHE) as f:
-            all_items = json.load(f)
-        hist_index = build_amazon_costco_index(all_items)
-        hist_rows = load_historical_split_rows()
-        hist_split_index = build_split_index(hist_rows)
-        hist_matched, _ = match_splits_to_ntc(hist_split_index, hist_index)
-        hist_unknown = 0
-        for txn_item, clf_rows in hist_matched:
-            bad = [r for r in clf_rows if not resolve_envelope_uuid(r["envelope"], env_map)]
-            if bad:
-                hist_unknown += len(bad)
-                continue
-            update_split_envelope(None, txn_item, clf_rows, env_map, None,
-                                  dry_run=True, prefix="HIST-SPLIT")
-        print(f"Historical split summary: {len(hist_matched)} groups to update, "
-              f"{hist_unknown} unknown envelopes.")
-
-    if historical_single:
-        with open(ALL_TXN_CACHE) as f:
-            all_items = json.load(f)
-        clr_index = build_clr_txn_index(all_items)
-        hist_rows = load_historical_clr_rows()
-        matched, no_match, _ = match_classified_to_ntc(hist_rows, clr_index)
-        already_correct = 0
-        for clf_row, txn_item in matched:
-            desired_uuid = resolve_envelope_uuid(clf_row["envelope"], env_map)
-            if txn_item["envelope_uuid"] == desired_uuid:
-                already_correct += 1
-                continue
-            date = txn_item["created"][:10]
-            print(f"[DRY RUN HIST-1] {txn_item['receiver'][:45]:<45}  {date}  "
-                  f"${txn_item['amount']:>10}  →  {clf_row['envelope']}")
-        print(f"\nHistorical single summary: {len(matched)-already_correct} to update, "
-              f"{already_correct} already correct (skipped), {len(no_match)} no match.")
-
-
-def cmd_show_splits(opener):
-    with open(NTC_CACHE) as f:
-        ntc_items = json.load(f)
-    ntc_index = build_ntc_index(ntc_items)
-    split_rows = load_split_rows()
+    split_rows = load_classified_rows(sources=("amazon_order", "costco_receipt"), status="NTC")
     split_index = build_split_index(split_rows)
     matched, no_match = match_splits_to_ntc(split_index, ntc_index)
 
@@ -689,14 +642,42 @@ def cmd_show_splits(opener):
         print("\nNo unmatched NTC Amazon/Costco transactions.")
 
 
-def cmd_historical_single(opener, limit=None):
-    """Live update: reclassify CLR single-envelope transactions where classified.csv disagrees."""
+def run_updates(items, update_fn, receiver_fn, label="", quiet=False):
+    """Run update_fn(item) for each item. Returns (updated, skipped, aborted).
+
+    update_fn(item) should return True on success, False to skip.
+    receiver_fn(item) returns a display string for progress output.
+    quiet: suppress per-item progress lines (e.g. for dry-run where update_fn prints its own output).
+    Catches RuntimeError and aborts on first failure.
+    """
+    updated = 0
+    skipped = 0
+    try:
+        for i, item in enumerate(items, 1):
+            if not quiet:
+                desc = receiver_fn(item)[:60]
+                print(f"  [{label}] {i}/{len(items)}: {desc}" if label else
+                      f"  Updating {i}/{len(items)}: {desc}")
+            ok = update_fn(item)
+            if ok:
+                updated += 1
+            else:
+                skipped += 1
+    except RuntimeError as e:
+        print(f"ERROR: {e}")
+        print("Aborting.")
+        return updated, skipped, True
+    return updated, skipped, False
+
+
+def cmd_historical_single(opener, limit=None, dry_run=False):
+    """Reclassify CLR single-envelope transactions where classified.csv disagrees."""
     with open(ALL_TXN_CACHE) as f:
         all_items = json.load(f)
     clr_index = build_clr_txn_index(all_items)
-    hist_rows = load_historical_clr_rows()
+    hist_rows = load_classified_rows(source="goodbudget", status="CLR", exclude_envelopes=SKIP_ENVELOPES)
     env_map = get_envelope_map(opener)
-    household_id = get_household_id(opener)
+    household_id = get_household_id(opener) if not dry_run else None
 
     matched, no_match, _ = match_classified_to_ntc(hist_rows, clr_index)
 
@@ -723,35 +704,31 @@ def cmd_historical_single(opener, limit=None):
     if limit and limit < (len(matched) - already_correct - unknown_env):
         print(f"  (applying --limit {limit})")
 
-    updated = 0
-    skipped = 0
-    try:
-        for i, (clf_row, txn_item) in enumerate(to_update, 1):
-            print(f"  Updating {i}/{len(to_update)}: {txn_item['receiver'][:60]}")
-            ok = update_envelope(opener, txn_item, clf_row, env_map, household_id)
-            if ok:
-                updated += 1
-            else:
-                skipped += 1
-    except RuntimeError as e:
-        print(f"ERROR: {e}")
-        print("Aborting.")
+    updated, skipped, aborted = run_updates(
+        to_update,
+        lambda pair: update_envelope(opener, pair[1], pair[0], env_map, household_id,
+                                     dry_run=dry_run, prefix="HIST-1"),
+        lambda pair: pair[1]["receiver"],
+        quiet=dry_run,
+    )
+    if aborted:
         return
 
-    print(f"\nUpdated {updated}. Already correct (skipped): {already_correct}. "
+    label = "to update" if dry_run else "updated"
+    print(f"\n{updated} {label}. Already correct (skipped): {already_correct}. "
           f"Unknown envelope: {unknown_env + skipped}. No-match: {len(no_match)}.")
 
 
-def cmd_sync(opener, limit=None):
-    """Live update: assign envelopes to NTC single-envelope transactions."""
+def cmd_sync(opener, limit=None, dry_run=False):
+    """Assign envelopes to NTC single-envelope transactions."""
     with open(NTC_CACHE) as f:
         ntc_items = json.load(f)
     ntc_index = build_ntc_index(ntc_items)
     total_needs = sum(len(v) for v in ntc_index.values())
 
-    classified_rows = load_classified()
+    classified_rows = load_classified_rows(source="goodbudget", exclude_envelopes=SKIP_ENVELOPES)
     env_map = get_envelope_map(opener)
-    household_id = get_household_id(opener)
+    household_id = get_household_id(opener) if not dry_run else None
 
     matched, no_match, _ = match_classified_to_ntc(classified_rows, ntc_index)
     to_update = matched[:limit] if limit else matched
@@ -761,83 +738,72 @@ def cmd_sync(opener, limit=None):
     if limit and limit < len(matched):
         print(f"  (applying --limit {limit}: updating first {limit} only)")
 
-    updated = 0
-    skipped = 0
-    try:
-        for i, (clf_row, ntc_item) in enumerate(to_update, 1):
-            print(f"  Updating {i}/{len(to_update)}: {ntc_item['receiver'][:60]}")
-            ok = update_envelope(opener, ntc_item, clf_row, env_map, household_id)
-            if ok:
-                updated += 1
-            else:
-                skipped += 1
-    except RuntimeError as e:
-        print(f"ERROR: {e}")
-        print("Aborting.")
+    updated, skipped, aborted = run_updates(
+        to_update,
+        lambda pair: update_envelope(opener, pair[1], pair[0], env_map, household_id,
+                                     dry_run=dry_run),
+        lambda pair: pair[1]["receiver"],
+        quiet=dry_run,
+    )
+    if aborted:
         return
 
-    print(f"\nUpdated {updated}. Skipped {skipped} (unknown envelope). No-match: {len(no_match)}.")
+    print(f"\nSummary: {updated} {'to update' if dry_run else 'updated'}. "
+          f"{skipped} skipped (unknown envelope). {len(no_match)} no-match.")
 
 
-def cmd_sync_splits(opener, limit=None, historical=False):
-    """Live update: assign split envelopes to NTC Amazon/Costco transactions."""
+def cmd_sync_splits(opener, limit=None, historical=False, dry_run=False):
+    """Assign split envelopes to NTC Amazon/Costco transactions."""
     with open(NTC_CACHE) as f:
         ntc_items = json.load(f)
     ntc_index = build_ntc_index(ntc_items)
-    split_rows = load_split_rows()
+    split_rows = load_classified_rows(sources=("amazon_order", "costco_receipt"), status="NTC")
     split_index = build_split_index(split_rows)
     split_matched, split_no_match = match_splits_to_ntc(split_index, ntc_index)
     env_map = get_envelope_map(opener)
-    household_id = get_household_id(opener)
+    household_id = get_household_id(opener) if not dry_run else None
 
     to_update = split_matched[:limit] if limit else split_matched
     print(f"NTC splits: {len(split_matched)} matched, {len(split_no_match)} no-match.")
     if limit and limit < len(split_matched):
         print(f"  (applying --limit {limit})")
 
-    updated = skipped = 0
-    try:
-        for i, (ntc_item, clf_rows) in enumerate(to_update, 1):
-            print(f"  Updating {i}/{len(to_update)}: {ntc_item['receiver'][:60]}")
-            ok = update_split_envelope(opener, ntc_item, clf_rows, env_map, household_id)
-            if ok:
-                updated += 1
-            else:
-                skipped += 1
-    except RuntimeError as e:
-        print(f"ERROR: {e}")
-        print("Aborting.")
+    updated, skipped, aborted = run_updates(
+        to_update,
+        lambda pair: update_split_envelope(opener, pair[0], pair[1], env_map, household_id,
+                                           dry_run=dry_run),
+        lambda pair: pair[0]["receiver"],
+        quiet=dry_run,
+    )
+    if aborted:
         return
 
-    print(f"\nSplits updated {updated}. Skipped {skipped}. No-match: {len(split_no_match)}.")
+    print(f"\nSplits: {updated} {'to update' if dry_run else 'updated'}. "
+          f"{skipped} skipped. {len(split_no_match)} no-match.")
 
     if historical:
         with open(ALL_TXN_CACHE) as f:
             all_items = json.load(f)
         hist_index = build_amazon_costco_index(all_items)
-        hist_rows = load_historical_split_rows()
+        hist_rows = load_classified_rows(sources=("amazon_order", "costco_receipt"), status="CLR")
         hist_split_index = build_split_index(hist_rows)
         hist_matched, hist_no_match = match_splits_to_ntc(hist_split_index, hist_index)
         hist_to_update = hist_matched[:limit] if limit else hist_matched
         print(f"\nHistorical CLR splits: {len(hist_matched)} matched, {len(hist_no_match)} no-match.")
         if limit and limit < len(hist_matched):
             print(f"  (applying --limit {limit})")
-        hist_updated = hist_skipped = 0
-        try:
-            for i, (txn_item, clf_rows) in enumerate(hist_to_update, 1):
-                print(f"  Updating {i}/{len(hist_to_update)}: {txn_item['receiver'][:60]}")
-                ok = update_split_envelope(opener, txn_item, clf_rows, env_map, household_id,
-                                           prefix="HIST-SPLIT")
-                if ok:
-                    hist_updated += 1
-                else:
-                    hist_skipped += 1
-        except RuntimeError as e:
-            print(f"ERROR: {e}")
-            print("Aborting.")
+        hist_updated, hist_skipped, aborted = run_updates(
+            hist_to_update,
+            lambda pair: update_split_envelope(opener, pair[0], pair[1], env_map, household_id,
+                                               dry_run=dry_run, prefix="HIST-SPLIT"),
+            lambda pair: pair[0]["receiver"],
+            label="HIST",
+            quiet=dry_run,
+        )
+        if aborted:
             return
-        print(f"Historical splits updated {hist_updated}. Skipped {hist_skipped}. "
-              f"No-match: {len(hist_no_match)}.")
+        print(f"Historical splits: {hist_updated} {'to update' if dry_run else 'updated'}. "
+              f"{hist_skipped} skipped. {len(hist_no_match)} no-match.")
 
 
 COMMANDS = {
@@ -860,28 +826,39 @@ def main():
                         help="Also match/update CLR (already-cleared) Amazon/Costco transactions")
     parser.add_argument("--limit", type=int, default=None,
                         help="Limit number of live single-envelope updates (for testing)")
-    parser.add_argument("--splits-only", action="store_true",
-                        help="Write only split (Amazon/Costco) transactions (Step 10)")
-    parser.add_argument("--historical-single", action="store_true",
-                        help="Reclassify CLR non-split transactions (Step 9.5)")
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--splits-only", action="store_true",
+                            help="Write only split (Amazon/Costco) transactions (Step 10)")
+    mode_group.add_argument("--historical-single", action="store_true",
+                            help="Reclassify CLR non-split transactions (Step 9.5)")
     args = parser.parse_args()
+
+    # Steps that don't need a live session
+    OFFLINE_STEPS = {"classified", "show-splits"}
+    offline_match = (args.step == "match" and not args.historical_single)
+
+    if args.step in OFFLINE_STEPS:
+        COMMANDS[args.step]()
+        return
+    if offline_match:
+        cmd_match(historical=args.historical)
+        return
+
     with session() as opener:
-        if args.dry_run:
-            cmd_dry_run(opener, historical=args.historical,
-                        historical_single=args.historical_single)
-        elif args.step == "match":
+        if args.step == "match":
             cmd_match(opener, historical=args.historical,
                       historical_single=args.historical_single)
         elif args.step:
             COMMANDS[args.step](opener)
+        elif args.historical_single:
+            cmd_historical_single(opener, limit=args.limit, dry_run=args.dry_run)
+        elif args.splits_only:
+            cmd_sync_splits(opener, limit=args.limit, historical=args.historical,
+                            dry_run=args.dry_run)
         else:
-            if args.historical_single:
-                cmd_historical_single(opener, limit=args.limit)
-            elif args.splits_only:
-                cmd_sync_splits(opener, limit=args.limit, historical=args.historical)
-            else:
-                cmd_sync(opener, limit=args.limit)
-                cmd_sync_splits(opener, historical=args.historical)
+            cmd_sync(opener, limit=args.limit, dry_run=args.dry_run)
+            cmd_sync_splits(opener, limit=args.limit, historical=args.historical,
+                            dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
