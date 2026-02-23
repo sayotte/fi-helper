@@ -498,14 +498,40 @@ def cmd_dry_run(opener, historical=False):
               f"{hist_unknown} unknown envelopes.")
 
 
+def cmd_show_splits(opener):
+    with open(NTC_CACHE) as f:
+        ntc_items = json.load(f)
+    ntc_index = build_ntc_index(ntc_items)
+    split_rows = load_split_rows()
+    split_index = build_split_index(split_rows)
+    matched, no_match = match_splits_to_ntc(split_index, ntc_index)
+
+    print(f"{len(matched)} matched split groups:\n")
+    for ntc_item, clf_rows in matched:
+        date = ntc_item["created"][:10]
+        total = ntc_item["amount"]
+        print(f"  {ntc_item['receiver']:<30}  {date}  ${total}")
+        for row in clf_rows:
+            amt = abs(float(row["amount"]))
+            print(f"      ${amt:>8.2f}  {row['envelope']:<35}  {row['name']}")
+
+    if no_match:
+        print(f"\n{len(no_match)} unmatched NTC Amazon/Costco transactions:")
+        for item in no_match:
+            print(f"  {item['created'][:10]}  {item['receiver']:<30}  ${item['amount']}")
+    else:
+        print("\nNo unmatched NTC Amazon/Costco transactions.")
+
+
 COMMANDS = {
-    "auth":       cmd_auth,
-    "envelopes":  cmd_envelopes,
-    "accounts":   cmd_accounts,
-    "ntc":        cmd_ntc,
-    "fetch-all":  cmd_fetch_all,
-    "classified": cmd_classified,
-    "match":      cmd_match,
+    "auth":        cmd_auth,
+    "envelopes":   cmd_envelopes,
+    "accounts":    cmd_accounts,
+    "ntc":         cmd_ntc,
+    "fetch-all":   cmd_fetch_all,
+    "classified":  cmd_classified,
+    "match":       cmd_match,
+    "show-splits": cmd_show_splits,
 }
 
 
