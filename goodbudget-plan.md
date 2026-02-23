@@ -511,6 +511,67 @@ Manually verify in Goodbudget UI: those 5 transactions now have correct envelope
 
 ---
 
+### Step 9.5 — Live update, historical single-envelope reclassification
+
+Reclassify already-categorized (CLR) non-split goodbudget transactions where
+`classified.csv` disagrees with the current envelope.  Uses `all_txn_cache.json`
+(written by `--step fetch-all`).
+
+**New functions:**
+
+`load_historical_clr_rows()` — loads `classified.csv` rows where
+`source == "goodbudget"` AND `status == "CLR"` AND `envelope not in SKIP_ENVELOPES`.
+
+`build_clr_txn_index(all_txn_items)` — builds `{(date, abs_amount, receiver): [items]}`
+from `all_txn_cache.json`, skipping:
+- `envelope_uuid == NEEDS_ENVELOPE_UUID` (NTC, handled elsewhere)
+- `receiver in AMAZON_COSTCO_RECEIVERS` (handled by split path)
+- `item.get("parentUuid")` non-empty (split children — not addressable standalone)
+- `item.get("trans_type") == "SPL"` (split parents — envelope is null, children hold the envelopes)
+
+**Matching:** reuse `match_classified_to_ntc(historical_clr_rows, clr_index)` unchanged —
+same ±1 day, same consume-from-pool logic.
+
+**Skip-if-correct check (critical safety guard):**
+After matching, for each `(clf_row, txn_item)` pair:
+```python
+desired_uuid = resolve_envelope_uuid(clf_row["envelope"], env_map)
+if txn_item["envelope_uuid"] == desired_uuid:
+    skip_count += 1
+    continue
+```
+Only update rows where the current envelope differs from the desired one.
+
+**Reuse `update_envelope()` from Step 9** — the POST payload is identical; only the
+source of `txn_item` changes (CLR cache vs NTC cache).
+
+**Dry-run + match integration:**
+- `--dry-run --historical-single`: print `[DRY RUN HIST-1]` lines for rows that *would*
+  change; print `[SKIP already correct]` summary count for rows that would be left alone.
+- `--step match --historical-single`: show match counts + skip-if-correct preview count
+  (requires loading `env_map`, so this step needs a live session).
+
+**CLI:**
+
+```bash
+# Preview what would change
+python3 sync_goodbudget.py --dry-run --historical-single
+
+# Batch of 5 first
+python3 sync_goodbudget.py --historical-single --limit 5
+```
+
+Expected dry-run output:
+```
+[DRY RUN HIST-1] BUSINESSOLVER BE              2025-11-15  $  2673.75  Health:Premiums  (was: [Needs Envelope])
+...
+Historical single summary: N to update, N already correct (skipped), N no match.
+```
+
+Manually verify in Goodbudget UI: those 5 transactions now show the new envelope.
+
+---
+
 ### Step 10 — Live update, split transactions (batch of 5 first)
 
 ```bash
@@ -550,6 +611,7 @@ Verify: log into Goodbudget; [Needs Envelope] count drops from 232 to ~9.
 | `--dry-run` | Full pipeline, no writes |
 | `--limit N` | Write only first N matched transactions |
 | `--splits-only` | Write only split (Amazon/Costco) transactions |
+| `--historical-single` | Reclassify CLR non-split transactions (skip-if-already-correct) |
 | *(none)* | Full pipeline, all writes |
 
 ---
@@ -588,3 +650,10 @@ Breda Pest Management,contains,Household:Pest Control,
 **Prerequisite**: the envelope `Household:Pest Control` must be created manually in the
 Goodbudget UI (under the `Household` group) before sync will assign it — `resolve_envelope_uuid`
 returns `None` for unknown envelope names and skips the transaction with a warning.
+
+### Configurable confirmation behavior
+
+Currently `update_envelope()` always sets `status="CLR"` (auto-confirm). Add a
+`--no-confirm` flag (default: confirm) so that manually-entered transactions can be synced
+without being confirmed — Goodbudget needs to match a manually-entered transaction to its
+bank import before it should be CLR'd.

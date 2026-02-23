@@ -443,6 +443,61 @@ def resolve_envelope_uuid(env_name, env_map):
     return None
 
 
+def update_envelope(opener, ntc_item, clf_row, env_map, household_id):
+    """GET nonce, then POST to assign a single envelope to an NTC transaction.
+
+    Returns True on success, False if the envelope name cannot be resolved (skip).
+    Raises RuntimeError on any unexpected API response.
+    """
+    env_uuid = resolve_envelope_uuid(clf_row["envelope"], env_map)
+    if not env_uuid:
+        print(f"  SKIP (unknown envelope {clf_row['envelope']!r}): {ntc_item['receiver']}")
+        return False
+
+    # Fetch current transaction detail to get nonce and canonical field values
+    url = f"{BASE_URL}/api/transactions/get/{ntc_item['uuid']}"
+    with opener.open(url) as resp:
+        txn_detail = json.loads(resp.read().decode("utf-8"))
+    nonce = txn_detail["nonce"]
+
+    payload = {
+        "created":   txn_detail["created"],
+        "uuid":      txn_detail["uuid"],
+        "receiver":  txn_detail["receiver"],
+        "status":    "CLR",
+        "note":      txn_detail.get("note", ""),
+        "envelope":  env_uuid,
+        "account":   txn_detail["account"],
+        "amount":    txn_detail["amount"],
+        "nonce":     nonce,
+        "type":      txn_detail["type"],
+        "check_num": txn_detail.get("check_num", ""),
+    }
+    d = base64.b64encode(json.dumps(payload).encode()).decode()
+    body = urllib.parse.urlencode({
+        "id": txn_detail["uuid"],
+        "household_id": household_id,
+        "n": nonce,
+        "o": "transaction",
+        "d": d,
+    }).encode()
+
+    save_url = f"{BASE_URL}/api/transactions/save?cltVersion=web"
+    req = urllib.request.Request(save_url, data=body, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+    req.add_header("Origin", BASE_URL)
+    with opener.open(req) as resp:
+        resp_data = json.loads(resp.read().decode("utf-8"))
+
+    if resp_data.get("status") != 202:
+        raise RuntimeError(
+            f"Unexpected response for {txn_detail['uuid']} {txn_detail['receiver']!r}: {resp_data}"
+        )
+
+    time.sleep(0.2)
+    return True
+
+
 def cmd_dry_run(opener, historical=False):
     env_map = get_envelope_map(opener)
     with open(NTC_CACHE) as f:
@@ -523,6 +578,47 @@ def cmd_show_splits(opener):
         print("\nNo unmatched NTC Amazon/Costco transactions.")
 
 
+def cmd_sync(opener, limit=None):
+    """Live update: assign envelopes to NTC single-envelope transactions."""
+    with open(NTC_CACHE) as f:
+        ntc_items = json.load(f)
+    ntc_index = build_ntc_index(ntc_items)
+    total_needs = sum(len(v) for v in ntc_index.values())
+
+    classified_rows = load_classified()
+    split_rows = load_split_rows()
+    split_index = build_split_index(split_rows)
+
+    env_map = get_envelope_map(opener)
+    household_id = get_household_id(opener)
+
+    matched, no_match, _ = match_classified_to_ntc(classified_rows, ntc_index)
+    to_update = matched[:limit] if limit else matched
+
+    print(f"Single-envelope: {len(matched)} matched, {len(no_match)} no-match "
+          f"(of {total_needs} total NTC [Needs Envelope]).")
+    if limit and limit < len(matched):
+        print(f"  (applying --limit {limit}: updating first {limit} only)")
+
+    updated = 0
+    skipped = 0
+    try:
+        for i, (clf_row, ntc_item) in enumerate(to_update, 1):
+            print(f"  Updating {i}/{len(to_update)}: {ntc_item['receiver'][:60]}")
+            ok = update_envelope(opener, ntc_item, clf_row, env_map, household_id)
+            if ok:
+                updated += 1
+            else:
+                skipped += 1
+    except RuntimeError as e:
+        print(f"ERROR: {e}")
+        print("Aborting.")
+        return
+
+    print(f"\nUpdated {updated}. Skipped {skipped} (unknown envelope). No-match: {len(no_match)}.")
+    print(f"(split transactions: {len(split_index)} groups, deferred to Step 10)")
+
+
 COMMANDS = {
     "auth":        cmd_auth,
     "envelopes":   cmd_envelopes,
@@ -541,6 +637,12 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--historical", action="store_true",
                         help="Also match/update CLR (already-cleared) Amazon/Costco transactions")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Limit number of live single-envelope updates (for testing)")
+    parser.add_argument("--splits-only", action="store_true",
+                        help="Write only split (Amazon/Costco) transactions (Step 10)")
+    parser.add_argument("--historical-single", action="store_true",
+                        help="Reclassify CLR non-split transactions (Step 9.5)")
     args = parser.parse_args()
     with session() as opener:
         if args.dry_run:
@@ -550,7 +652,7 @@ def main():
         elif args.step:
             COMMANDS[args.step](opener)
         else:
-            parser.print_help()
+            cmd_sync(opener, limit=args.limit)
 
 
 if __name__ == "__main__":
