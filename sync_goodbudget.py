@@ -217,11 +217,9 @@ def get_all_transactions(opener):
         url = f"{BASE_URL}/api/transactions?page={page}&_={ts}"
         with opener.open(url) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        if total is None:
-            total = data["count"]
-            num_pages = math.ceil(total / 120)
-        all_items.extend(data["items"])
-        if len(all_items) >= total or page >= num_pages:
+        page_items = data["items"]
+        all_items.extend(page_items)
+        if len(page_items) < 120:
             break
         page += 1
     return all_items
@@ -268,6 +266,17 @@ def load_historical_split_rows():
     return rows
 
 
+def load_historical_clr_rows():
+    rows = []
+    with open(CLASSIFIED_CSV, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if (row["source"] == "goodbudget"
+                    and row["status"] == "CLR"
+                    and row["envelope"] not in SKIP_ENVELOPES):
+                rows.append(row)
+    return rows
+
+
 def build_amazon_costco_index(all_txn_items):
     """Index CLR Amazon/Costco transactions. Skips NTC items (already handled by split matching)."""
     index = {}
@@ -276,6 +285,25 @@ def build_amazon_costco_index(all_txn_items):
             continue
         if item.get("envelope_uuid") == NEEDS_ENVELOPE_UUID:
             continue  # NTC — already handled by existing split matching
+        date = datetime.date.fromisoformat(item["created"][:10])
+        amt = round(float(item["amount"]), 2)
+        key = (date, amt, item["receiver"])
+        index.setdefault(key, []).append(item)
+    return index
+
+
+def build_clr_txn_index(all_txn_items):
+    """Index CLR non-split, non-Amazon/Costco transactions for historical reclassification."""
+    index = {}
+    for item in all_txn_items:
+        if item.get("envelope_uuid") == NEEDS_ENVELOPE_UUID:
+            continue  # NTC — handled elsewhere
+        if item["receiver"] in AMAZON_COSTCO_RECEIVERS:
+            continue  # handled by split path
+        if item.get("parentUuid"):
+            continue  # split child — not independently addressable
+        if item.get("trans_type") == "SPL":
+            continue  # split parent — envelope is null; children hold envelopes
         date = datetime.date.fromisoformat(item["created"][:10])
         amt = round(float(item["amount"]), 2)
         key = (date, amt, item["receiver"])
@@ -389,7 +417,7 @@ def match_classified_to_ntc(classified_rows, ntc_index):
     return matched, no_match, []
 
 
-def cmd_match(opener, historical=False):
+def cmd_match(opener, historical=False, historical_single=False):
     with open(NTC_CACHE) as f:
         ntc_items = json.load(f)
     ntc_index = build_ntc_index(ntc_items)
@@ -428,6 +456,23 @@ def cmd_match(opener, historical=False):
         if hist_no_match:
             for item in hist_no_match:
                 print(f"  {item['created'][:10]} | {item['receiver'][:50]} | ${item['amount']}")
+
+    if historical_single:
+        with open(ALL_TXN_CACHE) as f:
+            all_items = json.load(f)
+        clr_index = build_clr_txn_index(all_items)
+        hist_rows = load_historical_clr_rows()
+        matched, no_match, _ = match_classified_to_ntc(hist_rows, clr_index)
+        env_map = get_envelope_map(opener)
+        already_correct = sum(
+            1 for clf_row, txn_item in matched
+            if txn_item["envelope_uuid"] == resolve_envelope_uuid(clf_row["envelope"], env_map)
+        )
+        print(f"\nHistorical single match ({len(hist_rows)} CLR rows):")
+        print(f"  Matched:         {len(matched)}")
+        print(f"  Already correct: {already_correct}")
+        print(f"  Would update:    {len(matched) - already_correct}")
+        print(f"  No match:        {len(no_match)}")
 
 
 def resolve_envelope_uuid(env_name, env_map):
@@ -498,7 +543,7 @@ def update_envelope(opener, ntc_item, clf_row, env_map, household_id):
     return True
 
 
-def cmd_dry_run(opener, historical=False):
+def cmd_dry_run(opener, historical=False, historical_single=False):
     env_map = get_envelope_map(opener)
     with open(NTC_CACHE) as f:
         ntc_items = json.load(f)
@@ -552,6 +597,24 @@ def cmd_dry_run(opener, historical=False):
         print(f"Historical split summary: {len(hist_matched)} groups to update, "
               f"{hist_unknown} unknown envelopes.")
 
+    if historical_single:
+        with open(ALL_TXN_CACHE) as f:
+            all_items = json.load(f)
+        clr_index = build_clr_txn_index(all_items)
+        hist_rows = load_historical_clr_rows()
+        matched, no_match, _ = match_classified_to_ntc(hist_rows, clr_index)
+        already_correct = 0
+        for clf_row, txn_item in matched:
+            desired_uuid = resolve_envelope_uuid(clf_row["envelope"], env_map)
+            if txn_item["envelope_uuid"] == desired_uuid:
+                already_correct += 1
+                continue
+            date = txn_item["created"][:10]
+            print(f"[DRY RUN HIST-1] {txn_item['receiver'][:45]:<45}  {date}  "
+                  f"${txn_item['amount']:>10}  →  {clf_row['envelope']}")
+        print(f"\nHistorical single summary: {len(matched)-already_correct} to update, "
+              f"{already_correct} already correct (skipped), {len(no_match)} no match.")
+
 
 def cmd_show_splits(opener):
     with open(NTC_CACHE) as f:
@@ -576,6 +639,59 @@ def cmd_show_splits(opener):
             print(f"  {item['created'][:10]}  {item['receiver']:<30}  ${item['amount']}")
     else:
         print("\nNo unmatched NTC Amazon/Costco transactions.")
+
+
+def cmd_historical_single(opener, limit=None):
+    """Live update: reclassify CLR single-envelope transactions where classified.csv disagrees."""
+    with open(ALL_TXN_CACHE) as f:
+        all_items = json.load(f)
+    clr_index = build_clr_txn_index(all_items)
+    hist_rows = load_historical_clr_rows()
+    env_map = get_envelope_map(opener)
+    household_id = get_household_id(opener)
+
+    matched, no_match, _ = match_classified_to_ntc(hist_rows, clr_index)
+
+    already_correct = 0
+    unknown_env = 0
+    to_update = []
+    for clf_row, txn_item in matched:
+        desired_uuid = resolve_envelope_uuid(clf_row["envelope"], env_map)
+        if not desired_uuid:
+            unknown_env += 1
+            continue
+        if txn_item["envelope_uuid"] == desired_uuid:
+            already_correct += 1
+            continue
+        to_update.append((clf_row, txn_item))
+
+    if limit:
+        to_update = to_update[:limit]
+
+    print(f"Historical single-envelope: {len(matched)} matched, {len(no_match)} no-match.")
+    print(f"  Already correct (skipped): {already_correct}")
+    print(f"  Unknown envelope: {unknown_env}")
+    print(f"  To update: {len(to_update)}")
+    if limit and limit < (len(matched) - already_correct - unknown_env):
+        print(f"  (applying --limit {limit})")
+
+    updated = 0
+    skipped = 0
+    try:
+        for i, (clf_row, txn_item) in enumerate(to_update, 1):
+            print(f"  Updating {i}/{len(to_update)}: {txn_item['receiver'][:60]}")
+            ok = update_envelope(opener, txn_item, clf_row, env_map, household_id)
+            if ok:
+                updated += 1
+            else:
+                skipped += 1
+    except RuntimeError as e:
+        print(f"ERROR: {e}")
+        print("Aborting.")
+        return
+
+    print(f"\nUpdated {updated}. Already correct (skipped): {already_correct}. "
+          f"Unknown envelope: {unknown_env + skipped}. No-match: {len(no_match)}.")
 
 
 def cmd_sync(opener, limit=None):
@@ -646,13 +762,18 @@ def main():
     args = parser.parse_args()
     with session() as opener:
         if args.dry_run:
-            cmd_dry_run(opener, historical=args.historical)
+            cmd_dry_run(opener, historical=args.historical,
+                        historical_single=args.historical_single)
         elif args.step == "match":
-            cmd_match(opener, historical=args.historical)
+            cmd_match(opener, historical=args.historical,
+                      historical_single=args.historical_single)
         elif args.step:
             COMMANDS[args.step](opener)
         else:
-            cmd_sync(opener, limit=args.limit)
+            if args.historical_single:
+                cmd_historical_single(opener, limit=args.limit)
+            else:
+                cmd_sync(opener, limit=args.limit)
 
 
 if __name__ == "__main__":
