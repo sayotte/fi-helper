@@ -353,7 +353,7 @@ def update_split_envelope(opener, ntc_item, clf_rows, env_map, household_id,
         env_uuid = resolve_envelope_uuid(row["envelope"], env_map)
         if not env_uuid:
             print(f"  SKIP (unknown envelope {row['envelope']!r}): {ntc_item['receiver']}")
-            return
+            return False
         resolved.append((row, env_uuid))
 
     unique_envs = {env_uuid for _, env_uuid in resolved}
@@ -371,8 +371,56 @@ def update_split_envelope(opener, ntc_item, clf_rows, env_map, household_id,
                 print(f"    {abs(float(row['amount'])):>8.2f}  {row['envelope']}")
         return
 
-    # Live path deferred to Step 10
-    raise NotImplementedError("Live split updates implemented in Step 10")
+    # Single-envelope shortcut: reuse existing update_envelope
+    if len(unique_envs) == 1:
+        return update_envelope(opener, ntc_item, clf_rows[0], env_map, household_id)
+
+    # Multi-envelope split: GET nonce, POST SPL payload with children
+    url = f"{BASE_URL}/api/transactions/get/{ntc_item['uuid']}"
+    with opener.open(url) as resp:
+        txn_detail = json.loads(resp.read().decode("utf-8"))
+    nonce = txn_detail["nonce"]
+
+    children = [
+        {"uuid": str(uuid.uuid4()), "envelope": env_uuid,
+         "amount": f"{abs(float(row['amount'])):.2f}"}
+        for row, env_uuid in resolved
+    ]
+    payload = {
+        "created":   txn_detail["created"],
+        "uuid":      txn_detail["uuid"],
+        "receiver":  txn_detail["receiver"],
+        "status":    "CLR",
+        "note":      txn_detail.get("note", ""),
+        "envelope":  None,
+        "account":   txn_detail["account"],
+        "amount":    txn_detail["amount"],
+        "nonce":     nonce,
+        "type":      "SPL",
+        "check_num": txn_detail.get("check_num", ""),
+        "children":  children,
+    }
+    d = base64.b64encode(json.dumps(payload).encode()).decode()
+    body = urllib.parse.urlencode({
+        "id": txn_detail["uuid"],
+        "household_id": household_id,
+        "n": nonce,
+        "o": "transaction",
+        "d": d,
+    }).encode()
+    save_url = f"{BASE_URL}/api/transactions/save?cltVersion=web"
+    req = urllib.request.Request(save_url, data=body, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+    req.add_header("Origin", BASE_URL)
+    with opener.open(req) as resp:
+        resp_data = json.loads(resp.read().decode("utf-8"))
+    if resp_data.get("status") != 202:
+        raise RuntimeError(
+            f"Unexpected split response for {txn_detail['uuid']} "
+            f"{txn_detail['receiver']!r}: {resp_data}"
+        )
+    time.sleep(0.2)
+    return True
 
 
 def cmd_classified(opener):
@@ -702,9 +750,6 @@ def cmd_sync(opener, limit=None):
     total_needs = sum(len(v) for v in ntc_index.values())
 
     classified_rows = load_classified()
-    split_rows = load_split_rows()
-    split_index = build_split_index(split_rows)
-
     env_map = get_envelope_map(opener)
     household_id = get_household_id(opener)
 
@@ -732,7 +777,64 @@ def cmd_sync(opener, limit=None):
         return
 
     print(f"\nUpdated {updated}. Skipped {skipped} (unknown envelope). No-match: {len(no_match)}.")
-    print(f"(split transactions: {len(split_index)} groups, deferred to Step 10)")
+
+
+def cmd_sync_splits(opener, limit=None, historical=False):
+    """Live update: assign split envelopes to NTC Amazon/Costco transactions."""
+    with open(NTC_CACHE) as f:
+        ntc_items = json.load(f)
+    ntc_index = build_ntc_index(ntc_items)
+    split_rows = load_split_rows()
+    split_index = build_split_index(split_rows)
+    split_matched, split_no_match = match_splits_to_ntc(split_index, ntc_index)
+    env_map = get_envelope_map(opener)
+    household_id = get_household_id(opener)
+
+    to_update = split_matched[:limit] if limit else split_matched
+    print(f"NTC splits: {len(split_matched)} matched, {len(split_no_match)} no-match.")
+    if limit and limit < len(split_matched):
+        print(f"  (applying --limit {limit})")
+
+    updated = skipped = 0
+    try:
+        for i, (ntc_item, clf_rows) in enumerate(to_update, 1):
+            print(f"  Updating {i}/{len(to_update)}: {ntc_item['receiver'][:60]}")
+            ok = update_split_envelope(opener, ntc_item, clf_rows, env_map, household_id)
+            if ok:
+                updated += 1
+            else:
+                skipped += 1
+    except RuntimeError as e:
+        print(f"ERROR: {e}")
+        print("Aborting.")
+        return
+
+    print(f"\nSplits updated {updated}. Skipped {skipped}. No-match: {len(split_no_match)}.")
+
+    if historical:
+        with open(ALL_TXN_CACHE) as f:
+            all_items = json.load(f)
+        hist_index = build_amazon_costco_index(all_items)
+        hist_rows = load_historical_split_rows()
+        hist_split_index = build_split_index(hist_rows)
+        hist_matched, hist_no_match = match_splits_to_ntc(hist_split_index, hist_index)
+        print(f"\nHistorical CLR splits: {len(hist_matched)} matched, {len(hist_no_match)} no-match.")
+        hist_updated = hist_skipped = 0
+        try:
+            for i, (txn_item, clf_rows) in enumerate(hist_matched, 1):
+                print(f"  Updating {i}/{len(hist_matched)}: {txn_item['receiver'][:60]}")
+                ok = update_split_envelope(opener, txn_item, clf_rows, env_map, household_id,
+                                           prefix="HIST-SPLIT")
+                if ok:
+                    hist_updated += 1
+                else:
+                    hist_skipped += 1
+        except RuntimeError as e:
+            print(f"ERROR: {e}")
+            print("Aborting.")
+            return
+        print(f"Historical splits updated {hist_updated}. Skipped {hist_skipped}. "
+              f"No-match: {len(hist_no_match)}.")
 
 
 COMMANDS = {
@@ -772,8 +874,11 @@ def main():
         else:
             if args.historical_single:
                 cmd_historical_single(opener, limit=args.limit)
+            elif args.splits_only:
+                cmd_sync_splits(opener, limit=args.limit, historical=args.historical)
             else:
                 cmd_sync(opener, limit=args.limit)
+                cmd_sync_splits(opener, historical=args.historical)
 
 
 if __name__ == "__main__":
