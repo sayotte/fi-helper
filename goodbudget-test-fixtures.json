@@ -1,0 +1,89 @@
+{
+  "_comment": "Example API payloads captured from Goodbudget. Used for unit test mocking.",
+
+  "constants": {
+    "household_id":        "bd45c196-67e1-4fb3-bc8b-4b62169357b2",
+    "needs_envelope_uuid": "7b0e8896-963e-40f3-942f-324d8e71e8e8",
+    "available_uuid":      "(fetch at runtime — ENV_INC type)",
+    "accounts": {
+      "Wells Fargo:Checking:Primary": "17958583-2944-4814-8a2c-4ebf92f1190d",
+      "Wells Fargo Visa":             "1075fd0d-0d73-4708-8054-f9ab1d0e15bc"
+    },
+    "envelopes": {
+      "Automotive:Gas":         "59f44f05-c8c1-4f72-854d-07aeb7a960a1",
+      "Discretionary:Shopping": "18319ff3-ced1-408f-96b5-3eb0edb4ab13"
+    },
+    "observed_counts": {
+      "ntc_total":       274,
+      "ntc_needs_env":   232,
+      "ntc_categorized": 42,
+      "envelope_count":   52,
+      "account_count":     9,
+      "classified_goodbudget_rows": 913
+    }
+  },
+
+  "ntc_item_example": {
+    "uuid":          "019c5d57-30f8-8094-85b7-d96b905c26f0",
+    "envelope_uuid": "7b0e8896-963e-40f3-942f-324d8e71e8e8",
+    "account_uuid":  "17958583-2944-4814-8a2c-4ebf92f1190d",
+    "receiver":      "ONLINE TRANSFER REF #...",
+    "amount":        "10190.44",
+    "trans_type":    "DEB",
+    "created":       "2026-02-13 00:00:00",
+    "status":        "",
+    "check_num":     "",
+    "description":   ""
+  },
+
+  "txn_detail_example": {
+    "_comment": "Response from GET /api/transactions/get/<uuid>. Fetch nonce immediately before update.",
+    "uuid":      "f7dc82bf-eaef-4824-be45-79b4932ff303",
+    "receiver":  "TESTPAYEE",
+    "created":   "2026-02-21 20:29:15",
+    "amount":    "100.00",
+    "note":      "",
+    "check_num": "123",
+    "type":      "DEB",
+    "nonce":     "8a51dedf99acc4622551afd1aed1a62a09772dff",
+    "status":    "",
+    "envelope":  "18319ff3-ced1-408f-96b5-3eb0edb4ab13",
+    "account":   "17958583-2944-4814-8a2c-4ebf92f1190d"
+  },
+
+  "split_payload_create": {
+    "_comment": "POST /api/transactions/save d-param (base64 JSON) for creating a new split. n='' (no nonce).",
+    "created":   "2026-02-22 16:24:42",
+    "uuid":      "eb791074-c6f9-4e5d-a63b-5b3e1d958e1a",
+    "receiver":  "test",
+    "note":      "",
+    "envelope":  null,
+    "account":   "17958583-2944-4814-8a2c-4ebf92f1190d",
+    "amount":    "123.45",
+    "type":      "SPL",
+    "check_num": "",
+    "children": [
+      {"uuid": "2f424baa-a7f2-4d75-8567-e736dba8a160", "envelope": "59f44f05-c8c1-4f72-854d-07aeb7a960a1", "amount": "93.45"},
+      {"uuid": "89f44f52-9817-41f9-bdfe-d9c54a3f7e68", "envelope": "0bb29d0b-8c63-419a-972d-018b3716dc1b", "amount": "30"}
+    ]
+  },
+
+  "split_payload_realloc": {
+    "_comment": "POST /api/transactions/save d-param for re-allocating an existing txn to multi-envelope. n=<nonce>.",
+    "created":   "2026-02-22 16:24:42",
+    "uuid":      "eb791074-c6f9-4e5d-a63b-5b3e1d958e1a",
+    "receiver":  "test",
+    "status":    "",
+    "note":      "",
+    "envelope":  null,
+    "account":   "17958583-2944-4814-8a2c-4ebf92f1190d",
+    "amount":    "123.45",
+    "nonce":     "a5e1f0b6e1e20acd198a4257ba1f93aecc000943",
+    "type":      "SPL",
+    "check_num": "",
+    "children": [
+      {"uuid": "f88c2885-c005-4621-be18-cd58650756c1", "envelope": "59f44f05-c8c1-4f72-854d-07aeb7a960a1", "amount": "93.45"},
+      {"uuid": "4b951978-e1d5-457f-a1ca-f2c683543cd7", "envelope": "0bb29d0b-8c63-419a-972d-018b3716dc1b", "amount": "30.00"}
+    ]
+  }
+}
