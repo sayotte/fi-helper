@@ -818,11 +818,14 @@ def cmd_sync_splits(opener, limit=None, historical=False):
         hist_rows = load_historical_split_rows()
         hist_split_index = build_split_index(hist_rows)
         hist_matched, hist_no_match = match_splits_to_ntc(hist_split_index, hist_index)
+        hist_to_update = hist_matched[:limit] if limit else hist_matched
         print(f"\nHistorical CLR splits: {len(hist_matched)} matched, {len(hist_no_match)} no-match.")
+        if limit and limit < len(hist_matched):
+            print(f"  (applying --limit {limit})")
         hist_updated = hist_skipped = 0
         try:
-            for i, (txn_item, clf_rows) in enumerate(hist_matched, 1):
-                print(f"  Updating {i}/{len(hist_matched)}: {txn_item['receiver'][:60]}")
+            for i, (txn_item, clf_rows) in enumerate(hist_to_update, 1):
+                print(f"  Updating {i}/{len(hist_to_update)}: {txn_item['receiver'][:60]}")
                 ok = update_split_envelope(opener, txn_item, clf_rows, env_map, household_id,
                                            prefix="HIST-SPLIT")
                 if ok:
