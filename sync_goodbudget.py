@@ -460,6 +460,27 @@ def build_ntc_index(ntc_items):
     return index
 
 
+def build_ntc_misclassified_index(ntc_items):
+    """Index NTC Amazon/Costco transactions that already have a (possibly wrong) envelope.
+
+    These were manually classified or synced incorrectly. build_ntc_index skips them
+    because they're not [Needs Envelope], but they may need reclassification.
+    """
+    index = {}
+    for item in ntc_items:
+        if item["receiver"] not in AMAZON_COSTCO_RECEIVERS:
+            continue
+        if item.get("envelope_uuid") == NEEDS_ENVELOPE_UUID:
+            continue  # handled by regular NTC path
+        if item.get("envelope_uuid") is None:
+            continue  # no envelope set (or income) — skip
+        date = datetime.date.fromisoformat(item["created"][:10])
+        amt = round(abs(float(item["amount"])), 2)
+        key = (date, amt, item["receiver"])
+        index.setdefault(key, []).append(item)
+    return index
+
+
 def match_classified_to_ntc(classified_rows, ntc_index):
     # Mutable pools so duplicate transactions consume one NTC item each
     available = {key: list(items) for key, items in ntc_index.items()}
@@ -812,6 +833,38 @@ def cmd_sync_splits(opener, limit=None, historical=False, dry_run=False):
 
     print(f"\nSplits: {updated} {'to update' if dry_run else 'updated'}. "
           f"{skipped} skipped. {len(split_no_match)} no-match.")
+
+    # Second pass: reclassify NTC splits with wrong envelopes (manually mis-classified)
+    mis_index = build_ntc_misclassified_index(ntc_items)
+    if mis_index:
+        first_pass_uuids = {ntc["uuid"] for ntc, _ in split_matched}
+        mis_matched, _ = match_splits_to_ntc(split_index, mis_index)
+        mis_to_update = []
+        for ntc_item, clf_rows in mis_matched:
+            if ntc_item["uuid"] in first_pass_uuids:
+                continue
+            # Skip if single-envelope and already correct
+            if len(clf_rows) == 1:
+                desired = resolve_envelope_uuid(clf_rows[0]["envelope"], env_map)
+                if ntc_item.get("envelope_uuid") == desired:
+                    continue
+            mis_to_update.append((ntc_item, clf_rows))
+
+        if mis_to_update:
+            to_reclass = mis_to_update[:limit] if limit else mis_to_update
+            print(f"\nNTC reclassify: {len(mis_to_update)} Amazon/Costco with wrong envelope"
+                  + (f" (applying --limit {limit})" if limit and limit < len(mis_to_update) else "") + ".")
+            mis_updated, mis_skipped, aborted = run_updates(
+                to_reclass,
+                lambda pair: update_split_envelope(opener, pair[0], pair[1], env_map, household_id,
+                                                   dry_run=dry_run, prefix="RECLASS"),
+                lambda pair: pair[0]["receiver"],
+                quiet=dry_run,
+            )
+            if aborted:
+                return
+            print(f"Reclassified: {mis_updated} {'to update' if dry_run else 'updated'}. "
+                  f"{mis_skipped} skipped (unknown envelope).")
 
     if historical:
         with open(ALL_TXN_CACHE) as f:
