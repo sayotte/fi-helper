@@ -160,6 +160,51 @@ Response: `{"status":202,"reason":"Record Created"}` (202 for both create and up
 
 ---
 
+### Update Transaction Envelope (income)
+
+Income transactions (`classified.csv` envelope starts with `Income:`) require a different
+structure. Detection: `clf_row["envelope"].startswith("Income:")`.
+
+Same endpoint and POST format. Key differences from single-envelope:
+
+- `"type": "INC"`, `"envelope": null`
+- `"amount"` is a **negative float** (not a positive string) — money flowing into the account
+- Add `"children"` array with one entry: `"type": "ADJ"`, `"envelope": "<available-uuid>"`,
+  same negative amount, plus `receiver`/`created`/`nonce`/`check_num` from parent and a fresh UUID
+- Child `"status"` is `"NTC"` even when parent `"status"` is `"CLR"`
+- `Income:*` envelope names (e.g. `Income:Interest`) don't exist in Goodbudget; they all map to
+  `[Available]` via `resolve_envelope_uuid`
+
+Example payload (from `income-example.sh`):
+```json
+{
+  "created": "2026-01-31 00:00:00",
+  "uuid": "<txn-uuid>",
+  "receiver": "INTEREST",
+  "status": "CLR",
+  "note": "",
+  "envelope": null,
+  "account": "<account-uuid>",
+  "amount": -0.36,
+  "nonce": "<nonce>",
+  "type": "INC",
+  "check_num": "",
+  "children": [{
+    "amount": -0.36,
+    "check_num": "",
+    "created": "2026-01-31 00:00:00",
+    "envelope": "<available-uuid>",
+    "nonce": "<nonce>",
+    "receiver": "INTEREST",
+    "status": "NTC",
+    "type": "ADJ",
+    "uuid": "<new-uuid>"
+  }]
+}
+```
+
+---
+
 ### Update Transaction Envelope (split / multi-envelope)
 
 Same endpoint and POST format. Key differences:
@@ -174,7 +219,7 @@ See `goodbudget-test-fixtures.json` → `split_payload_create` / `split_payload_
 ### Key rules:
 - `n` (POST body param) and `"nonce"` (in JSON) must be the **same** value fetched from GET
 - `"amount"` is always a **positive** string (e.g. `"2673.75"`, not `"-2673.75"`)
-- `"type"` is `"DEB"` for expenses (negative in classified.csv), `"CRE"` for income/refunds
+- `"type"` is `"DEB"` for expenses, `"CRE"` for credit/refunds, `"INC"` (with children) for income (envelope starts with `Income:`)
 - `"status"` is `""` for normal update, `"DEL"` for delete, `"CLR"` to confirm
 
 ---

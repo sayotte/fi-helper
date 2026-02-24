@@ -580,19 +580,49 @@ def update_envelope(opener, ntc_item, clf_row, env_map, household_id,
     txn_detail = json.loads(api_request(opener, url, label=f"get nonce {ntc_item['receiver'][:30]}"))
     nonce = txn_detail["nonce"]
 
-    payload = {
-        "created":   txn_detail["created"],
-        "uuid":      txn_detail["uuid"],
-        "receiver":  txn_detail["receiver"],
-        "status":    "CLR",
-        "note":      txn_detail.get("note", ""),
-        "envelope":  env_uuid,
-        "account":   txn_detail["account"],
-        "amount":    txn_detail["amount"],
-        "nonce":     nonce,
-        "type":      txn_detail["type"],
-        "check_num": txn_detail.get("check_num", ""),
-    }
+    if clf_row["envelope"].startswith("Income:"):
+        # Income transactions require type=INC with a children array (ADJ child carries the envelope).
+        # Amount is a negative float (money flowing into the account) per the Goodbudget API.
+        neg_amount = -abs(float(txn_detail["amount"]))
+        child = {
+            "amount":    neg_amount,
+            "check_num": txn_detail.get("check_num", ""),
+            "created":   txn_detail["created"],
+            "envelope":  env_uuid,
+            "nonce":     nonce,
+            "receiver":  txn_detail["receiver"],
+            "status":    "NTC",
+            "type":      "ADJ",
+            "uuid":      str(uuid.uuid4()),
+        }
+        payload = {
+            "created":   txn_detail["created"],
+            "uuid":      txn_detail["uuid"],
+            "receiver":  txn_detail["receiver"],
+            "status":    "CLR",
+            "note":      txn_detail.get("note", ""),
+            "envelope":  None,
+            "account":   txn_detail["account"],
+            "amount":    neg_amount,
+            "nonce":     nonce,
+            "type":      "INC",
+            "check_num": txn_detail.get("check_num", ""),
+            "children":  [child],
+        }
+    else:
+        payload = {
+            "created":   txn_detail["created"],
+            "uuid":      txn_detail["uuid"],
+            "receiver":  txn_detail["receiver"],
+            "status":    "CLR",
+            "note":      txn_detail.get("note", ""),
+            "envelope":  env_uuid,
+            "account":   txn_detail["account"],
+            "amount":    txn_detail["amount"],
+            "nonce":     nonce,
+            "type":      txn_detail["type"],
+            "check_num": txn_detail.get("check_num", ""),
+        }
     d = base64.b64encode(json.dumps(payload).encode()).decode()
     body = urllib.parse.urlencode({
         "id": txn_detail["uuid"],
