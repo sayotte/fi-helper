@@ -92,10 +92,19 @@ Response:
 **WARNING**: `numPages` is always 0 (bug). Calculate page count as `ceil(count / 120)`.
 Paginate from page=1 until items_received >= count.
 
-Each item has: `uuid`, `envelope_uuid`, `account_uuid`, `receiver`, `amount` (positive string),
-`trans_type` (`"DEB"` or `"CRE"`), `created` (`"YYYY-MM-DD HH:MM:SS"`), `status`, `check_num`.
+Each item has: `uuid`, `envelope_uuid`, `account_uuid`, `receiver`, `amount`,
+`trans_type` (`"DEB"`, `"CRE"`, or `"INC"`), `created` (`"YYYY-MM-DD HH:MM:SS"`), `status`, `check_num`.
 
-Filter for `[Needs Envelope]` with: `item["envelope_uuid"] == "7b0e8896-963e-40f3-942f-324d8e71e8e8"`
+**Amount sign**: positive string for expenses/refunds (`"DEB"`/`"CRE"`); **negative** for income
+(`"INC"`, e.g. `"-760.83"`). Always use `abs()` when building index keys.
+
+**Envelope for unprocessed transactions**:
+- Expenses/refunds awaiting categorization: `envelope_uuid == NEEDS_ENVELOPE_UUID`
+- Income transactions awaiting categorization: `envelope_uuid == null`, `trans_type == "INC"`
+- Already-categorized: any other UUID (or null for SPL parents)
+
+To select NTC transactions that need envelope assignment: check `envelope_uuid == NEEDS_ENVELOPE_UUID`
+OR (`envelope_uuid is null` AND `trans_type == "INC"`).
 
 ---
 

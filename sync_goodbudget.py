@@ -322,7 +322,7 @@ def build_clr_txn_index(all_txn_items):
         if item.get("trans_type") == "SPL":
             continue  # split parent — envelope is null; children hold envelopes
         date = datetime.date.fromisoformat(item["created"][:10])
-        amt = round(float(item["amount"]), 2)
+        amt = round(abs(float(item["amount"])), 2)
         key = (date, amt, item["receiver"])
         index.setdefault(key, []).append(item)
     return index
@@ -449,10 +449,12 @@ def cmd_classified(opener=None):
 def build_ntc_index(ntc_items):
     index = {}
     for item in ntc_items:
-        if item["envelope_uuid"] != NEEDS_ENVELOPE_UUID:
+        needs_env = item.get("envelope_uuid") == NEEDS_ENVELOPE_UUID
+        is_income = item.get("envelope_uuid") is None and item.get("trans_type") == "INC"
+        if not needs_env and not is_income:
             continue
         date = datetime.date.fromisoformat(item["created"][:10])
-        amt = round(float(item["amount"]), 2)
+        amt = round(abs(float(item["amount"])), 2)
         key = (date, amt, item["receiver"])
         index.setdefault(key, []).append(item)
     return index
